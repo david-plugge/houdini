@@ -32,17 +32,17 @@ export default async function typescriptGenerator(
 		plugins: [
 			// Each plugin should be an object
 			{
-				typescript: {}, // Here you can pass configuration to the plugin
+				typescriptPlugin: {}, // Here you can pass configuration to the plugin
 			},
 			{
-				operations: {
+				operationsPlugin: {
 					fragmentMasking: true,
 				},
 			},
 		],
 		pluginMap: {
-			typescript: typescriptPlugin,
-			operations: operationsPlugin,
+			typescriptPlugin,
+			operationsPlugin,
 		},
 	})
 	await fs.writeFile(config.internalTypeDefinitionFile, typeDefinitionsFile, 'utf-8')

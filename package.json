@@ -85,6 +85,7 @@
 	"dependencies": {
 		"@babel/parser": "^7.17.2",
 		"@graphql-codegen/core": "^2.5.1",
+		"@graphql-codegen/gql-tag-operations-preset": "^1.4.0",
 		"@graphql-codegen/typescript": "^2.5.1",
 		"@graphql-codegen/typescript-operations": "^2.4.2",
 		"@graphql-tools/schema": "^8.3.7",
