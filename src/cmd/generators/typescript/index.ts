@@ -6,12 +6,10 @@ import { codegen } from '@graphql-codegen/core'
 import * as graphql from 'graphql'
 import fs from 'fs/promises'
 import path from 'path'
-import { ProgramKind } from 'ast-types/gen/kinds'
-import { tsTypeReference } from './typeReference'
+import { ProgramKind, IdentifierKind } from 'ast-types/gen/kinds'
 // locals
 import { Config } from '../../../common'
 import { CollectedGraphQLDocument } from '../../types'
-import { fragmentKey, inlineType } from './inlineType'
 import { scrubSelection, writeFile } from '../../utils'
 import { readonlyProperty } from './types'
 const AST = recast.types.builders
@@ -79,8 +77,7 @@ export default async function typescriptGenerator(
 
 			if (definition?.kind === 'OperationDefinition') {
 				// treat it as an operation document
-				// program = await generateOperationTypeDefs(config, program.body, definition)
-				program = AST.program([])
+				program = await generateOperationTypeDefs(config, definition)
 			} else {
 				// treat it as a fragment document
 				program = await generateFragmentTypeDefs(config, definition)
@@ -131,11 +128,12 @@ async function generateOperationTypeDefs(
 
 	// look up the root type of the document
 	let type: graphql.GraphQLNamedType | null | undefined
-	if (definition.operation === 'query') {
+	const { operation } = definition
+	if (operation === 'query') {
 		type = config.schema.getQueryType()
-	} else if (definition.operation === 'mutation') {
+	} else if (operation === 'mutation') {
 		type = config.schema.getMutationType()
-	} else if (definition.operation === 'subscription') {
+	} else if (operation === 'subscription') {
 		type = config.schema.getSubscriptionType()
 	}
 	if (!type) {
@@ -145,55 +143,73 @@ async function generateOperationTypeDefs(
 	// dry
 	const hasInputs = definition.variableDefinitions && definition.variableDefinitions.length > 0
 
-	// add our types to the body
-	program.body.push(
-		// add the root type named after the document that links the input and result types
-		AST.exportNamedDeclaration(
-			AST.tsTypeAliasDeclaration(
-				AST.identifier(definition.name!.value),
-				AST.tsTypeLiteral([
-					readonlyProperty(
-						AST.tsPropertySignature(
-							AST.stringLiteral('input'),
-							AST.tsTypeAnnotation(
-								hasInputs
-									? AST.tsTypeReference(AST.identifier(inputTypeName))
-									: AST.tsNullKeyword()
-							)
-						)
-					),
-					readonlyProperty(
-						AST.tsPropertySignature(
-							AST.stringLiteral('result'),
-							AST.tsTypeAnnotation(
-								definition.operation === 'mutation'
-									? AST.tsTypeReference(AST.identifier(shapeTypeName))
-									: AST.tsUnionType([
-											AST.tsTypeReference(AST.identifier(shapeTypeName)),
-											AST.tsUndefinedKeyword(),
-									  ])
-							)
-						)
-					),
-				])
-			)
-		),
-		// export the type that describes the result
-		AST.exportNamedDeclaration(
-			AST.tsTypeAliasDeclaration(
-				AST.identifier(shapeTypeName),
-				inlineType({
-					config,
-					rootType: type,
-					selections,
-					root: true,
-					allowReadonly: true,
-					visitedTypes,
-					body,
-				})
+	// we're going to need to input a few things:
+
+	// the type defining the shape of the query
+	const shapeType = AST.identifier(
+		definition.name!.value + operation[0].toUpperCase() + operation.slice(1)
+	)
+	program.body.push(internalTypeImport(config, shapeType))
+
+	// if we have inputs, we'll want to import the input shape
+	if (hasInputs) {
+		const inputType = AST.identifier(shapeType.name + 'Variables')
+
+		program.body.push(internalTypeImport(config, inputType))
+
+		// merge all of the variables into a single object
+		program.body.push(
+			AST.exportNamedDeclaration(
+				AST.tsTypeAliasDeclaration(
+					AST.identifier(inputTypeName),
+					AST.tsTypeReference(inputType)
+				)
 			)
 		)
-	)
+	}
+
+	// // the type describing the input
+	program.body // add our types to the body
+		.push(
+			// add the root type named after the document that links the input and result types
+			AST.exportNamedDeclaration(
+				AST.tsTypeAliasDeclaration(
+					AST.identifier(definition.name!.value),
+					AST.tsTypeLiteral([
+						readonlyProperty(
+							AST.tsPropertySignature(
+								AST.stringLiteral('input'),
+								AST.tsTypeAnnotation(
+									hasInputs
+										? AST.tsTypeReference(AST.identifier(inputTypeName))
+										: AST.tsNullKeyword()
+								)
+							)
+						),
+						readonlyProperty(
+							AST.tsPropertySignature(
+								AST.stringLiteral('result'),
+								AST.tsTypeAnnotation(
+									definition.operation === 'mutation'
+										? AST.tsTypeReference(AST.identifier(shapeTypeName))
+										: AST.tsUnionType([
+												AST.tsTypeReference(AST.identifier(shapeTypeName)),
+												AST.tsUndefinedKeyword(),
+										  ])
+								)
+							)
+						),
+					])
+				)
+			),
+			// export the type that describes the result
+			AST.exportNamedDeclaration(
+				AST.tsTypeAliasDeclaration(
+					AST.identifier(shapeTypeName),
+					AST.tsTypeReference(shapeType)
+				)
+			)
+		)
 
 	// generate type for the afterload function
 	const properties: ReturnType<typeof readonlyProperty>[] = [
@@ -251,34 +267,6 @@ async function generateOperationTypeDefs(
 		)
 	}
 
-	// if there are variables in this query
-	if (hasInputs && definition.variableDefinitions && definition.variableDefinitions.length > 0) {
-		for (const variableDefinition of definition.variableDefinitions) {
-			addReferencedInputTypes(config, body, visitedTypes, variableDefinition.type)
-		}
-
-		// merge all of the variables into a single object
-		program.body.push(
-			AST.exportNamedDeclaration(
-				AST.tsTypeAliasDeclaration(
-					AST.identifier(inputTypeName),
-					AST.tsTypeLiteral(
-						(definition.variableDefinitions || []).map(
-							(definition: graphql.VariableDefinitionNode) => {
-								// add a property describing the variable to the root object
-								return AST.tsPropertySignature(
-									AST.identifier(definition.variable.name.value),
-									AST.tsTypeAnnotation(tsTypeReference(config, definition)),
-									definition.type.kind !== 'NonNullType'
-								)
-							}
-						)
-					)
-				)
-			)
-		)
-	}
-
 	return program
 }
 
@@ -302,13 +290,7 @@ async function generateFragmentTypeDefs(
 	const internalType = AST.identifier(definition.name.value + 'Fragment')
 
 	// the first thing we need to do is import the corresponding type from the internal file
-	program.body.push(
-		AST.importDeclaration(
-			[AST.importSpecifier(internalType)],
-			AST.stringLiteral('./' + config.internalTypeDefinitionFileName),
-			'type'
-		)
-	)
+	program.body.push(internalTypeImport(config, internalType))
 
 	program.body.push(
 		// we need to add a type that will act as the entry point for the fragment
@@ -357,3 +339,13 @@ async function generateFragmentTypeDefs(
 
 	return program
 }
+
+function internalTypeImport(config: Config, identifier: IdentifierKind) {
+	return AST.importDeclaration(
+		[AST.importSpecifier(identifier)],
+		AST.stringLiteral('./' + config.internalTypeDefinitionFileName),
+		'type'
+	)
+}
+
+export const fragmentKey = '$fragments'
