@@ -1,17 +1,19 @@
 // externals
 import * as recast from 'recast'
+import * as typescriptPlugin from '@graphql-codegen/typescript'
+import * as operationsPlugin from '@graphql-codegen/typescript-operations'
+import { codegen } from '@graphql-codegen/core'
 import * as graphql from 'graphql'
-import { StatementKind } from 'ast-types/gen/kinds'
+import fs from 'fs/promises'
 import path from 'path'
+import { ProgramKind } from 'ast-types/gen/kinds'
+import { tsTypeReference } from './typeReference'
 // locals
 import { Config } from '../../../common'
 import { CollectedGraphQLDocument } from '../../types'
-import { flattenSelections, writeFile } from '../../utils'
-import { addReferencedInputTypes } from './addReferencedInputTypes'
-import { tsTypeReference } from './typeReference'
-import { readonlyProperty } from './types'
 import { fragmentKey, inlineType } from './inlineType'
-
+import { scrubSelection, writeFile } from '../../utils'
+import { readonlyProperty } from './types'
 const AST = recast.types.builders
 
 // typescriptGenerator generates typescript definitions for the artifacts
@@ -19,10 +21,40 @@ export default async function typescriptGenerator(
 	config: Config,
 	docs: CollectedGraphQLDocument[]
 ) {
+	// the actual type definitions are going to be created
+	const typeDefinitionsFile = await codegen({
+		documents: docs
+			.filter((doc) => doc.generateStore)
+			.map(({ document }) => {
+				return { document: scrubSelection(config, document) }
+			}),
+		config: {},
+		schema: graphql.parse(graphql.printSchema(config.schema)),
+		filename: '',
+		plugins: [
+			// Each plugin should be an object
+			{
+				typescript: {}, // Here you can pass configuration to the plugin
+			},
+			{
+				operations: {
+					fragmentMasking: true,
+				},
+			},
+		],
+		pluginMap: {
+			typescript: typescriptPlugin,
+			operations: operationsPlugin,
+		},
+	})
+	await fs.writeFile(config.internalTypeDefinitionFile, typeDefinitionsFile, 'utf-8')
+
+	// all that we need to do now is generate type definition files for each file that import
+	// and use the appropriate types from the codegen// every document needs a generated type
+
 	// build up a list of paths we have types in (to export from index.d.ts)
 	const typePaths: string[] = []
 
-	// every document needs a generated type
 	await Promise.all(
 		// the generated types depend solely on user-provided information
 		// so we need to use the original document that we haven't mutated
@@ -36,10 +68,7 @@ export default async function typescriptGenerator(
 			const typeDefPath = config.artifactTypePath(originalDocument)
 
 			// build up the program
-			const program = AST.program([])
-
-			// if we have to define any types along the way, make sure we only do it once
-			const visitedTypes = new Set<string>()
+			let program: ProgramKind
 
 			// if there's an operation definition
 			let definition = originalDocument.definitions.find(
@@ -48,30 +77,13 @@ export default async function typescriptGenerator(
 					def.name?.value === name
 			) as graphql.OperationDefinitionNode | graphql.FragmentDefinitionNode
 
-			// de-dupe/flatten the selection of the definition
-			const selections = flattenSelections({
-				config,
-				selections: definition.selectionSet.selections,
-			})
-
 			if (definition?.kind === 'OperationDefinition') {
 				// treat it as an operation document
-				await generateOperationTypeDefs(
-					config,
-					program.body,
-					definition,
-					selections,
-					visitedTypes
-				)
+				// program = await generateOperationTypeDefs(config, program.body, definition)
+				program = AST.program([])
 			} else {
 				// treat it as a fragment document
-				await generateFragmentTypeDefs(
-					config,
-					program.body,
-					selections,
-					originalDocument.definitions,
-					visitedTypes
-				)
+				program = await generateFragmentTypeDefs(config, definition)
 			}
 
 			// write the file contents
@@ -108,11 +120,10 @@ export default async function typescriptGenerator(
 
 async function generateOperationTypeDefs(
 	config: Config,
-	body: StatementKind[],
-	definition: graphql.OperationDefinitionNode,
-	selections: readonly graphql.SelectionNode[],
-	visitedTypes: Set<string>
+	definition: graphql.OperationDefinitionNode
 ) {
+	const program = AST.program([])
+
 	// the name of the types we will define
 	const inputTypeName = `${definition.name!.value}$input`
 	const shapeTypeName = `${definition.name!.value}$result`
@@ -135,7 +146,7 @@ async function generateOperationTypeDefs(
 	const hasInputs = definition.variableDefinitions && definition.variableDefinitions.length > 0
 
 	// add our types to the body
-	body.push(
+	program.body.push(
 		// add the root type named after the document that links the input and result types
 		AST.exportNamedDeclaration(
 			AST.tsTypeAliasDeclaration(
@@ -230,7 +241,7 @@ async function generateOperationTypeDefs(
 	}
 
 	if (definition.operation === 'query') {
-		body.push(
+		program.body.push(
 			AST.exportNamedDeclaration(
 				AST.tsTypeAliasDeclaration(
 					AST.identifier(afterLoadTypeName),
@@ -247,7 +258,7 @@ async function generateOperationTypeDefs(
 		}
 
 		// merge all of the variables into a single object
-		body.push(
+		program.body.push(
 			AST.exportNamedDeclaration(
 				AST.tsTypeAliasDeclaration(
 					AST.identifier(inputTypeName),
@@ -267,85 +278,82 @@ async function generateOperationTypeDefs(
 			)
 		)
 	}
+
+	return program
 }
 
 async function generateFragmentTypeDefs(
 	config: Config,
-	body: StatementKind[],
-	selections: readonly graphql.SelectionNode[],
-	definitions: readonly graphql.DefinitionNode[],
-	visitedTypes: Set<string>
-) {
-	// every definition will contribute the same thing to the typedefs
-	for (const definition of definitions) {
-		// if its not a fragment definition
-		if (definition.kind !== 'FragmentDefinition') {
-			// we don't know what to do
-			continue
-		}
+	definition: graphql.FragmentDefinitionNode
+): Promise<ProgramKind> {
+	const program = AST.program([])
 
-		// the name of the prop type
-		const propTypeName = definition.name.value
-		// the name of the shape type
-		const shapeTypeName = `${definition.name.value}$data`
+	// the name of the prop type
+	const propTypeName = definition.name.value
+	// the name of the shape type
+	const shapeTypeName = `${definition.name.value}$data`
 
-		// look up the root type of the document
-		const type = config.schema.getType(definition.typeCondition.name.value)
-		if (!type) {
-			throw new Error('Should not get here')
-		}
+	// look up the root type of the document
+	const type = config.schema.getType(definition.typeCondition.name.value)
+	if (!type) {
+		throw new Error('Should not get here')
+	}
 
-		body.push(
-			// we need to add a type that will act as the entry point for the fragment
-			// and be assigned to the prop that holds the reference passed from
-			// the fragment's parent
-			AST.exportNamedDeclaration(
-				AST.tsTypeAliasDeclaration(
-					AST.identifier(propTypeName),
-					AST.tsTypeLiteral([
-						readonlyProperty(
-							AST.tsPropertySignature(
-								AST.stringLiteral('shape'),
-								AST.tsTypeAnnotation(
-									AST.tsTypeReference(AST.identifier(shapeTypeName))
-								),
-								true
+	const internalType = AST.identifier(definition.name.value + 'Fragment')
+
+	// the first thing we need to do is import the corresponding type from the internal file
+	program.body.push(
+		AST.importDeclaration(
+			[AST.importSpecifier(internalType)],
+			AST.stringLiteral('./' + config.internalTypeDefinitionFileName),
+			'type'
+		)
+	)
+
+	program.body.push(
+		// we need to add a type that will act as the entry point for the fragment
+		// and be assigned to the prop that holds the reference passed from
+		// the fragment's parent
+		AST.exportNamedDeclaration(
+			AST.tsTypeAliasDeclaration(
+				AST.identifier(propTypeName),
+				AST.tsTypeLiteral([
+					readonlyProperty(
+						AST.tsPropertySignature(
+							AST.stringLiteral('shape'),
+							AST.tsTypeAnnotation(
+								AST.tsTypeReference(AST.identifier(shapeTypeName))
+							),
+							true
+						)
+					),
+					readonlyProperty(
+						AST.tsPropertySignature(
+							AST.stringLiteral(fragmentKey),
+							AST.tsTypeAnnotation(
+								AST.tsTypeLiteral([
+									AST.tsPropertySignature(
+										AST.stringLiteral(propTypeName),
+										AST.tsTypeAnnotation(
+											AST.tsLiteralType(AST.booleanLiteral(true))
+										)
+									),
+								])
 							)
-						),
-						readonlyProperty(
-							AST.tsPropertySignature(
-								AST.stringLiteral(fragmentKey),
-								AST.tsTypeAnnotation(
-									AST.tsTypeLiteral([
-										AST.tsPropertySignature(
-											AST.stringLiteral(propTypeName),
-											AST.tsTypeAnnotation(
-												AST.tsLiteralType(AST.booleanLiteral(true))
-											)
-										),
-									])
-								)
-							)
-						),
-					])
-				)
-			),
+						)
+					),
+				])
+			)
+		),
 
-			// export the type that describes the fragments response data
-			AST.exportNamedDeclaration(
-				AST.tsTypeAliasDeclaration(
-					AST.identifier(shapeTypeName),
-					inlineType({
-						config,
-						rootType: type,
-						selections,
-						root: true,
-						allowReadonly: true,
-						body,
-						visitedTypes,
-					})
-				)
+		// export the type that describes the fragments response data
+		AST.exportNamedDeclaration(
+			AST.tsTypeAliasDeclaration(
+				AST.identifier(shapeTypeName),
+				AST.tsTypeReference(internalType)
 			)
 		)
-	}
+	)
+
+	return program
 }

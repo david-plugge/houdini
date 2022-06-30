@@ -5,7 +5,7 @@ import * as recast from 'recast'
 import fs from 'fs/promises'
 // locals
 import { Config, getRootType, hashDocument, parentTypeFromAncestors } from '../../../common'
-import { moduleExport, writeFile } from '../../utils'
+import { moduleExport, scrubSelection, writeFile } from '../../utils'
 import selection from './selection'
 import { operationsByPath, FilterMap } from './operations'
 import writeIndexFile from './indexFile'
@@ -104,42 +104,8 @@ export default function artifactGenerator(stats: {
 						return
 					}
 
-					// before we can print the document, we need to strip:
-					// 1. all references to internal directives
-					// 2. all variables only used by internal directives
-					const usedVariableNames = new Set<string>()
-					let documentWithoutInternalDirectives = graphql.visit(document, {
-						Directive(node) {
-							// if the directive is one of the internal ones, remove it
-							if (config.isInternalDirective(node)) {
-								return null
-							}
-						},
-
-						Variable(node, _key, parent) {
-							const variableIsBeingDefined =
-								parent &&
-								!(parent instanceof Array) &&
-								parent.kind === 'VariableDefinition'
-
-							if (!variableIsBeingDefined) {
-								usedVariableNames.add(node.name.value)
-							}
-						},
-					})
-					let documentWithoutExtraVariables = graphql.visit(
-						documentWithoutInternalDirectives,
-						{
-							VariableDefinition(variableDefinitionNode) {
-								const name = variableDefinitionNode.variable.name.value
-
-								if (!usedVariableNames.has(name)) {
-									return null
-								}
-							},
-						}
-					)
-					let rawString = graphql.print(documentWithoutExtraVariables)
+					// generate a version of the document that the server can see
+					let rawString = graphql.print(scrubSelection(config, document))
 
 					// figure out the document kind
 					let docKind = doc.kind
